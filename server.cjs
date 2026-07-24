@@ -42,11 +42,11 @@ async function startServer() {
   });
   app.use(
     (0, import_http_proxy_middleware.createProxyMiddleware)({
-      pathFilter: "/api/proxy/dbosca",
+      pathFilter: "http://api-dbosca.dgiops.com/api",
       target: "http://api-dbosca.dgiops.com",
       changeOrigin: true,
       pathRewrite: {
-        "^/api/proxy/dbosca": "/api"
+        "^http://api-dbosca.dgiops.com/api": "/api"
       },
       on: {
         proxyReq: (proxyReq, req) => {
@@ -184,7 +184,19 @@ async function startServer() {
     res.json({ success: true });
   });
   app.get("/api/public/verify/:scid", async (req, res) => {
-    const { scid } = req.params;
+    let { scid } = req.params;
+    if (scid && (scid.includes("?scid=") || scid.includes("/merchant-validation"))) {
+      try {
+        if (scid.includes("?scid=")) {
+          const parts = scid.split("?scid=");
+          if (parts.length > 1) {
+            scid = parts[1].split("&")[0];
+          }
+        }
+      } catch (e) {
+        console.warn("[SERVER] Failed to parse scid from URL:", e);
+      }
+    }
     const decodeScid = (encoded) => {
       if (!encoded) return "";
       try {
@@ -208,8 +220,71 @@ async function startServer() {
       }
     };
     const decodedScid = decodeScid(scid);
-    const cleanScid = decodedScid.trim().toLowerCase();
+    const cleanScid = decodedScid.trim();
     console.log(`[SERVER] Public verification request for SCID: ${scid} (decoded: ${decodedScid})`);
+    try {
+      const verifyIdUrl = `http://api-dbosca.dgiops.com/api/verify-id/${encodeURIComponent(cleanScid)}`;
+      console.log(`[SERVER] Invoking external verify-id API: ${verifyIdUrl}`);
+      const verifyRes = await fetch(verifyIdUrl, {
+        method: "GET",
+        headers: {
+          "Accept": "application/json"
+        }
+      });
+      if (verifyRes.ok) {
+        const verifyData = await verifyRes.json();
+        console.log(`[SERVER] External API verify-id matched successfully:`, verifyData);
+        if (verifyData && (verifyData.status === "VALID ID - APPROVED" || verifyData.scid_number)) {
+          let photoUrl = "";
+          if (Array.isArray(verifyData.photo_url) && verifyData.photo_url.length > 0) {
+            const pathInfo = verifyData.photo_url[0].path || verifyData.photo_url[0].file_path || "";
+            if (pathInfo) {
+              photoUrl = `/api/proxy/storage/${pathInfo}`;
+            }
+          } else if (typeof verifyData.photo_url === "string" && verifyData.photo_url) {
+            photoUrl = verifyData.photo_url.startsWith("http") ? verifyData.photo_url : `/api/proxy/storage/${verifyData.photo_url}`;
+          }
+          if (!photoUrl) {
+            const seed = encodeURIComponent((verifyData.decrypted_profile || "senior").toLowerCase().replace(/\s+/g, "-"));
+            photoUrl = `https://picsum.photos/seed/${seed}/200/200`;
+          }
+          let calculatedBirthDate = "1954-12-25";
+          if (verifyData.age) {
+            const ageMatch = verifyData.age.match(/\d+/);
+            if (ageMatch) {
+              const ageVal = parseInt(ageMatch[0], 10);
+              calculatedBirthDate = `${2026 - ageVal}-01-01`;
+            }
+          }
+          const mappedCitizenObj = {
+            id: 99999,
+            citizen_id: verifyData.scid_number || cleanScid,
+            scid_number: verifyData.scid_number || cleanScid,
+            full_name: verifyData.decrypted_profile || "---",
+            first_name: verifyData.decrypted_profile || "---",
+            last_name: "",
+            birth_date: calculatedBirthDate,
+            age: verifyData.age ? parseInt(verifyData.age.match(/\d+/)?.[0] || "70", 10) : 70,
+            vital_status: "active",
+            id_status: "released",
+            barangay: "SAN JUAN CITY",
+            sex: verifyData.sex || "MALE",
+            photo_url: photoUrl,
+            message: verifyData.message
+          };
+          return res.json({
+            success: true,
+            citizen: mappedCitizenObj
+          });
+        }
+      } else if (verifyRes.status === 404) {
+        console.log(`[SERVER] External API verify-id returned 404. Attempting fallbacks.`);
+      } else {
+        console.warn(`[SERVER] External API verify-id returned status ${verifyRes.status}`);
+      }
+    } catch (err) {
+      console.error(`[SERVER] Error contacting external verify-id API:`, err);
+    }
     let idIssuancesList = [];
     if (latestToken) {
       try {
@@ -258,21 +333,26 @@ async function startServer() {
         photoUrl = `https://picsum.photos/seed/${seed}/200/200`;
       }
       return {
+        id: citizen.id || 99999,
         scid_number: scidVal,
         citizen_id: scidVal,
         full_name: maskNameServer(fullNameRaw),
         birth_date: citizen.birth_date || "---",
-        photo_url: photoUrl
+        photo_url: photoUrl,
+        vital_status: citizen.vital_status || "active",
+        id_status: citizen.id_status || "released",
+        age: citizen.age || 70,
+        barangay: citizen.barangay || "SAN JUAN CITY"
       };
     };
+    const cleanScidLower = cleanScid.toLowerCase();
     if (latestToken) {
       const issuanceRecord = idIssuancesList.find((item) => {
         const scidNum = (item.scid_number || item.user_details?.scid_number || "").toString().trim().toLowerCase();
         const citizenId = (item.citizen_id || item.user_details?.citizen_id || "").toString().trim().toLowerCase();
-        return scidNum === cleanScid || citizenId === cleanScid;
+        return scidNum === cleanScidLower || citizenId === cleanScidLower;
       });
       if (issuanceRecord) {
-        console.log(`[SERVER] Found citizen in pre-fetched external id-issuances: ${issuanceRecord.full_name || issuanceRecord.user_details && issuanceRecord.user_details.first_name}`);
         const standardized = {
           scid_number: issuanceRecord.scid_number || issuanceRecord.user_details?.scid_number,
           citizen_id: issuanceRecord.citizen_id || issuanceRecord.user_details?.citizen_id,
@@ -293,34 +373,29 @@ async function startServer() {
           const data = await response.json();
           const list = Array.isArray(data.data?.data) ? data.data.data : Array.isArray(data.data) ? data.data : Array.isArray(data) ? data : [];
           const citizen = list.find(
-            (c) => (c.scid_number || "").toString().trim().toLowerCase() === cleanScid || (c.citizen_id || "").toString().trim().toLowerCase() === cleanScid
+            (c) => (c.scid_number || "").toString().trim().toLowerCase() === cleanScidLower || (c.citizen_id || "").toString().trim().toLowerCase() === cleanScidLower
           );
           if (citizen) {
-            console.log(`[SERVER] Found citizen in external masterlist: ${citizen.full_name}`);
             return res.json({ success: true, citizen: sanitizeCitizenForPublic(citizen) });
           }
-        } else {
-          console.warn(`[SERVER] External API returned status ${response.status} with token.`);
         }
       } catch (err) {
         console.error(`[SERVER] Failed to query external API:`, err);
       }
     }
     const localCitizen = masterlist.find(
-      (c) => (c.scid_number || "").toString().trim().toLowerCase() === cleanScid || (c.citizen_id || "").toString().trim().toLowerCase() === cleanScid
+      (c) => (c.scid_number || "").toString().trim().toLowerCase() === cleanScidLower || (c.citizen_id || "").toString().trim().toLowerCase() === cleanScidLower
     );
     if (localCitizen) {
-      console.log(`[SERVER] Found citizen in local masterlist: ${localCitizen.full_name}`);
       return res.json({ success: true, citizen: sanitizeCitizenForPublic(localCitizen) });
     }
     const localApp = applications.find(
-      (a) => (a.scid_number || "").toString().trim().toLowerCase() === cleanScid || (a.citizen_id || "").toString().trim().toLowerCase() === cleanScid
+      (a) => (a.scid_number || "").toString().trim().toLowerCase() === cleanScidLower || (a.citizen_id || "").toString().trim().toLowerCase() === cleanScidLower
     );
     if (localApp) {
-      console.log(`[SERVER] Found citizen in local applications: ${localApp.first_name}`);
       return res.json({ success: true, citizen: sanitizeCitizenForPublic(localApp) });
     }
-    if (cleanScid === "2026-90199" || cleanScid === "scid-2026-90199") {
+    if (cleanScidLower === "2026-90199" || cleanScidLower === "scid-2026-90199") {
       const emergencyCitizen = {
         id: 99,
         citizen_id: "2026-90199",
